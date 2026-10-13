@@ -2,6 +2,7 @@ import telebot
 import google.generativeai as genai
 import firebase_admin
 from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 import json
 import os
 from datetime import datetime
@@ -9,7 +10,7 @@ import calendar
 from flask import Flask
 from threading import Thread
 
-# 1. إعداد المفاتيح من Render
+# 1. إعداد المفاتيح
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -21,26 +22,27 @@ cred = credentials.Certificate("firebase_credentials.json")
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# 3. إعداد نماذج الذكاء الاصطناعي (Gemini)
+# 3. إعداد نماذج الذكاء الاصطناعي (Gemini) 
 expense_instruction = """
-أنت محاسب ذكي في سوريا (طرطوس). مهمتك استخراج التكلفة الإجمالية المدفوعة من رسالة المستخدم بعد التأكد من أسعار السوق عبر البحث.
-الرد بصيغة JSON حصراً: {"total_spent": 15000, "message": "تم تسجيل المصروف، البندورة سعرها بالسوق كذا..."}
+أنت محاسب ذكي في سوريا (طرطوس). مهمتك استخراج التكلفة الإجمالية المدفوعة من رسالة المستخدم.
+يجب أن ترد بصيغة JSON حصراً بهذا الشكل:
+{"total_spent": 15000, "message": "تم تسجيل المصروف، السعر يعتبر طبيعي أو مرتفع قليلاً..."}
 """
+# إجبار النموذج على إرجاع JSON سليم
 expense_model = genai.GenerativeModel(
     model_name="gemini-1.5-pro",
     system_instruction=expense_instruction,
-    tools='google_search_retrieval'
+    generation_config={"response_mime_type": "application/json"} 
 )
 
 planning_instruction = """
 أنت مستشار مالي وطاهٍ اقتصادي في سوريا (طرطوس). 
-مهمتك قراءة الميزانية اليومية المتاحة للمستخدم، واقتراح خطة مشتريات أو طبخة تناسب تماماً هذا المبلغ بناءً على أسعار السوق الحالية في طرطوس.
+مهمتك قراءة الميزانية اليومية المتاحة للمستخدم، واقتراح خطة مشتريات أو طبخة تناسب تماماً هذا المبلغ بناءً على أسعار السوق التقريبية في طرطوس.
 رد بنص واضح ومنسق، بدون JSON.
 """
 planning_model = genai.GenerativeModel(
     model_name="gemini-1.5-pro",
-    system_instruction=planning_instruction,
-    tools='google_search_retrieval'
+    system_instruction=planning_instruction
 )
 
 # 4. دوال إدارة الميزانية
@@ -81,7 +83,8 @@ def registration_message(message):
             'current_month': current_month
         }, merge=True)
         bot.reply_to(message, f"✅ تم حفظ ميزانيتك الشهرية بنجاح: {amount:,.0f} ل.س.")
-    except:
+    except Exception as e:
+        print(f"Registration Error: {e}")
         bot.reply_to(message, "⚠️ اكتب الأمر وبجانبه الرقم. مثال: `/registration 2000000`", parse_mode="Markdown")
 
 @bot.message_handler(commands=['today', 'fortheday'])
@@ -99,16 +102,18 @@ def today_plan_message(message):
         daily_allowance = rem_budget / days_left if days_left > 0 else rem_budget
         
         today_str = today.strftime("%Y-%m-%d")
-        expenses_ref = db.collection('expenses').where('user_id', '==', message.chat.id).where('date', '==', today_str).stream()
+        # تم إصلاح تحذير الفلترة هنا
+        expenses_ref = db.collection('expenses').where(filter=FieldFilter('user_id', '==', message.chat.id)).where(filter=FieldFilter('date', '==', today_str)).stream()
         spent_today = sum(emp.to_dict().get('amount', 0) for emp in expenses_ref)
         
         remaining_for_today = daily_allowance - spent_today
-        prompt = f"التاريخ: {today_str}. الميزانية اليومية المسموحة للمستخدم هي {daily_allowance} ل.س. لقد صرف منها اليوم {spent_today} ل.س. المتبقي له لليوم هو {remaining_for_today} ل.س. اقترح عليه خطة مشتريات أو طبخة تناسب المبلغ المتبقي بناء على أسعار طرطوس الحالية."
+        prompt = f"التاريخ: {today_str}. الميزانية اليومية المسموحة للمستخدم هي {daily_allowance} ل.س. لقد صرف منها اليوم {spent_today} ل.س. المتبقي له لليوم هو {remaining_for_today} ل.س. اقترح عليه خطة مشتريات أو طبخة تناسب المبلغ المتبقي."
         
         response = planning_model.generate_content(prompt)
         plan_text = f"📊 **إحصائياتك لليوم:**\n- المسموح يومياً: {daily_allowance:,.0f} ل.س\n- صرفت اليوم: {spent_today:,.0f} ل.س\n- المتبقي لليوم: {remaining_for_today:,.0f} ل.س\n\n💡 **اقتراح اليوم:**\n{response.text}"
         bot.reply_to(message, plan_text, parse_mode="Markdown")
     except Exception as e:
+        print(f"Today Plan Error: {e}") # لطباعة الخطأ في Render
         bot.reply_to(message, "حدث خطأ أثناء جلب خطة اليوم.")
 
 @bot.message_handler(func=lambda message: True)
@@ -118,8 +123,7 @@ def handle_expenses(message):
     try:
         prompt = f"التاريخ اليوم: {datetime.now().strftime('%Y-%m-%d')}.\nرسالة المستخدم: {message.text}"
         response = expense_model.generate_content(prompt)
-        response_text = response.text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(response_text)
+        data = json.loads(response.text)
         
         amount = float(data.get("total_spent", 0))
         msg = data.get("message", "تم التسجيل.")
@@ -137,6 +141,7 @@ def handle_expenses(message):
         else:
             bot.reply_to(message, msg)
     except Exception as e:
+        print(f"Expense Handling Error: {e}") # لطباعة الخطأ في Render
         bot.reply_to(message, "حدث خطأ. تأكد من كتابة المصروف بوضوح.")
 
 # 6. سيرفر Flask
